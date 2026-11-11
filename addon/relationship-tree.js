@@ -20,6 +20,50 @@ const MAX_SHOWN_WARNINGS = 20;
 
 class CancelledError extends Error {}
 
+// ---------------------------------------------------------------------------------------------
+// Which child objects are walked.
+// By default only custom objects and core CRM objects are followed; everything else (History, Share, Feed,
+// platform and industry cloud objects, ...) explodes the number of API calls. The lists below are meant to be extended.
+// "Include system relationships" turns the allow-list and noise filtering off (see isChildWalkable).
+// ---------------------------------------------------------------------------------------------
+const NOISE_SUFFIXES = ["History", "Share", "Feed", "ChangeEvent", "__hd", "__e", "__x", "__mdt", "Tag", "OwnerSharingRule"];
+const NOISE_PREFIXES = ["ProcessInstance", "RecordAction"];
+const NOISE_NAMES = new Set([
+  "OutgoingEmail", "ActivityHistory", "OpenActivity", "AttachedContentDocument", "CombinedAttachment", "EmailStatus",
+  "NoteAndAttachment", "LookedUpFromActivity", "AttachedContentNote", "FeedComment", "FeedItem", "EntitySubscription",
+  "Vote", "TopicAssignment", "FlowRecordRelation", "FlowExecutionErrorEvent", "ContentDistribution", "ContentDocumentLink",
+  "ContentVersion", "PendingServiceRouting", "PendingServiceRoutingInteractionInfo", "AgentWork", "UserPrioritizedRecord",
+  "AIInsightValue", "AIRecordInsight", "AuthProvider", "UserRole",
+  // Task/Event WhatId-WhoId queries are often rewritten as OR, can be unsupported, and can hang for minutes
+  "Task", "Event", "EventRelation",
+  // High-cost on every parent at every layer; shown only when "Include system relationships" is on
+  "Note", "Attachment", "EmailMessage", "Partner", "AccountPartner", "OpportunityPartner",
+  "AccountContactRole", "AccountTeamMember", "User"
+]);
+// Standard objects that are walked when system relationships are excluded. Custom objects are always walked.
+const KEEP_STANDARD_NAMES = new Set([
+  "Account", "Contact", "Lead", "Opportunity", "OpportunityLineItem", "OpportunityContactRole", "AccountContactRelation",
+  "Case", "CaseComment", "Contract", "Asset",
+  "Order", "OrderItem", "Quote", "QuoteLineItem", "Campaign", "CampaignMember", "Product2", "PricebookEntry",
+]);
+// Used as a first guess so the walk can SELECT the name field before the object has been described.
+const KNOWN_NAME_FIELDS = {Case: "CaseNumber", Task: "Subject", Event: "Subject", Contract: "ContractNumber"};
+
+function isNoiseObjectName(name) {
+  return NOISE_NAMES.has(name)
+    || NOISE_SUFFIXES.some(suffix => name.endsWith(suffix))
+    || NOISE_PREFIXES.some(prefix => name.startsWith(prefix));
+}
+
+function isCustomObject(name, info) {
+  return Boolean(info && info.custom) || name.includes("__c");
+}
+
+function isOrUnsupportedError(err) {
+  let message = String((err && err.message) || err);
+  return /UNSUPPORTED_QUERY/i.test(message) || /operator OR/i.test(message);
+}
+
 function clampDepth(value) {
   let n = parseInt(value, 10);
   if (isNaN(n)) {
@@ -56,7 +100,7 @@ function formatValue(value) {
 }
 
 class Model {
-  constructor(sfHost, sobjectName, recordId) {
+  constructor(sfHost, sobjectName, recordId, includeSystem) {
     this.reactCallback = null;
     this.sfHost = sfHost;
     this.sfLink = "https://" + sfHost;
@@ -67,6 +111,7 @@ class Model {
     this.recordId = recordId;
 
     this.depthInput = String(DEFAULT_DEPTH);
+    this.includeSystem = includeSystem;
     this.rowsFilter = "";
     this.userInfoModel = new UserInfoModel((promise) => {
       this.spinnerCount++;
@@ -85,6 +130,8 @@ class Model {
     });
 
     this.describeCache = new Map(); // object API name -> Promise of describe (null when it failed)
+    this.globalPromise = null; // describeGlobal, requested once per page session
+    this.nameFields = new Map(); // object API name -> name field to query (null when the object has none), unknown when absent
     this.resetRun();
   }
 
@@ -99,11 +146,22 @@ class Model {
     this.currentLayer = 0;
     this.apiCalls = 0;
     this.warnings = [];
+    this.warnKeys = new Set();
+    this.unsupported = new Set(); // child objects whose queries failed, skipped for the rest of the walk
+    this.singleIdObjects = new Set(); // child objects that must be queried with one Id per query
+    this.phase = "";
+    this.edgeVersion = 0;
+    this.pathCache = new Map();
+    this.pathCacheVersion = 0;
+    this.lastRender = 0;
+    if (this.updateTimer) {
+      clearTimeout(this.updateTimer);
+    }
+    this.updateTimer = null;
     this.rootId = null;
     this.records = new Map(); // id -> {id, object, layer}
     this.edges = new Map(); // child id -> [{parentId, step}]
     this.values = new Map(); // id -> {fieldName: value}
-    this.fieldNames = new Map(); // object API name -> field names that were queried
     this.rows = [];
   }
 
@@ -113,10 +171,32 @@ class Model {
     }
   }
 
+  // Stops new API calls at once (api() throws), requests already in flight may still finish. Shows what was collected so far.
   cancel() {
     this.cancelled = true;
     this.stoppedEarly = true;
+    this.buildRows();
     this.didUpdate();
+  }
+
+  // Throttled re-render, used for the frequent API call counter
+  scheduleUpdate() {
+    if (this.updateTimer) {
+      return;
+    }
+    this.updateTimer = setTimeout(() => {
+      this.updateTimer = null;
+      this.didUpdate();
+    }, 250);
+  }
+
+  // Rebuilds the rows and re-renders, at most once per second unless forced
+  refreshRows(force) {
+    if (force || Date.now() - this.lastRender > 1000) {
+      this.lastRender = Date.now();
+      this.buildRows();
+      this.didUpdate();
+    }
   }
 
   // Every API call goes through here so they are counted and no new one starts after Cancel
@@ -125,17 +205,70 @@ class Model {
       throw new CancelledError("Cancelled");
     }
     this.apiCalls++;
-    this.didUpdate();
+    this.scheduleUpdate();
     return sfConn.rest(url, {logErrors: false});
   }
 
+  // Warnings are deduped: the same message is only listed once
   warn(message) {
-    this.warnings.push(message);
+    if (!this.warnKeys.has(message)) {
+      this.warnKeys.add(message);
+      this.warnings.push(message);
+    }
+  }
+
+  // describeGlobal, once. Resolves to Map name -> flags, or null when it failed (name rules only are used then).
+  describeGlobal() {
+    if (!this.globalPromise) {
+      this.globalPromise = this.api("/services/data/v" + apiVersion + "/sobjects")
+        .then(res => new Map(res.sobjects.map(o => [o.name, o])))
+        .catch(err => {
+          if (err instanceof CancelledError) {
+            this.globalPromise = null;
+            throw err;
+          }
+          this.warn("describeGlobal failed: " + (err.message || err));
+          return null;
+        });
+    }
+    return this.globalPromise;
+  }
+
+  markUnsupported(object) {
+    this.unsupported.add(object);
+    this.warn(object + ": query not supported, skipped");
+  }
+
+  // Decides if the child object of a relationship is queried. See the lists at the top of the file.
+  isChildWalkable(rel, globalInfo) {
+    let name = rel.childSObject;
+    if (!rel.relationshipName || rel.deprecatedAndHidden || this.unsupported.has(name)) {
+      return false;
+    }
+    let info = globalInfo ? globalInfo.get(name) : null;
+    if (globalInfo && (!info || !info.queryable || info.deprecatedAndHidden)) {
+      return false;
+    }
+    if (this.includeSystem) {
+      return true;
+    }
+    if (info && !info.retrieveable) {
+      return false;
+    }
+    if (isNoiseObjectName(name)) {
+      return false;
+    }
+    return isCustomObject(name, info) || KEEP_STANDARD_NAMES.has(name);
   }
 
   describe(name) {
     if (!this.describeCache.has(name)) {
       this.describeCache.set(name, this.api("/services/data/v" + apiVersion + "/sobjects/" + encodeURIComponent(name) + "/describe")
+        .then(describe => {
+          let nameField = describe.fields.find(f => f.nameField);
+          this.nameFields.set(describe.name, nameField ? nameField.name : null);
+          return describe;
+        })
         .catch(err => {
           if (err instanceof CancelledError) {
             this.describeCache.delete(name);
@@ -196,6 +329,7 @@ class Model {
     this.depth = clampDepth(this.depthInput);
     this.depthInput = String(this.depth);
     this.running = true;
+    this.finished = false;
     this.spinnerCount++;
     this.didUpdate();
     try {
@@ -206,17 +340,11 @@ class Model {
           throw err;
         }
       }
-      // Fetch fields for whatever records we already have, even after Cancel mid-walk.
-      // The user can press Cancel again to stop the field queries.
-      if (this.records.size > 0) {
-        this.cancelled = false;
-        try {
-          await this.loadFieldValues();
-        } finally {
-          if (this.stoppedEarly) {
-            this.cancelled = true;
-          }
-        }
+      // Fields are loaded after the walk, never after Cancel. The table is already filled with Id and Name by then.
+      if (this.records.size > 0 && !this.cancelled) {
+        this.phase = "Loading fields";
+        this.refreshRows(true);
+        await this.loadFieldValues();
       }
     } catch (err) {
       if (!(err instanceof CancelledError)) {
@@ -226,33 +354,92 @@ class Model {
     } finally {
       this.running = false;
       this.finished = true;
+      this.phase = "";
       this.spinnerCount--;
       this.buildRows();
       this.didUpdate();
     }
   }
 
-  isRelationshipUsable(rel, childDescribes) {
-    if (!rel.relationshipName || rel.deprecatedAndHidden) {
-      return false;
+  // Stores the values that were selected, so the table can show them while the walk is still running
+  mergeValues(id, rec) {
+    let key = shortId(id);
+    let values = this.values.get(key) || {};
+    for (let name of Object.keys(rec)) {
+      if (name != "attributes") {
+        values[name] = rec[name];
+      }
     }
-    let childDescribe = childDescribes.get(rel.childSObject);
-    return Boolean(childDescribe && childDescribe.queryable && !childDescribe.deprecatedAndHidden);
+    this.values.set(key, values);
+  }
+
+  // Queries the children of one chunk of parent Ids with a single IN (never OR). Selects the name field when it is known or likely.
+  async queryChildren(rel, ids) {
+    let object = rel.childSObject;
+    let build = nameField => {
+      let fields = ["Id"];
+      if (nameField && nameField != "Id" && nameField != rel.field) {
+        fields.push(nameField);
+      }
+      fields.push(rel.field);
+      return "SELECT " + fields.join(", ") + " FROM " + object + " WHERE " + rel.field + " IN (" + ids.map(soqlString).join(",") + ")";
+    };
+    let nameField = this.nameFields.has(object) ? this.nameFields.get(object) : (KNOWN_NAME_FIELDS[object] || "Name");
+    try {
+      return await this.queryAll(build(nameField));
+    } catch (err) {
+      if (nameField && !(err instanceof CancelledError) && /No such column/i.test(String(err.message))) {
+        this.nameFields.set(object, null);
+        return await this.queryAll(build(null));
+      }
+      throw err;
+    }
+  }
+
+  // Queries the children of the given parents. If the multi Id query fails because the object does not support it,
+  // the object is retried once with one Id per query. Any other failure marks the object unsupported.
+  async queryChildChunk(rel, ids) {
+    let object = rel.childSObject;
+    let children = [];
+    let groups = this.singleIdObjects.has(object) ? ids.map(id => [id]) : [ids];
+    for (let group of groups) {
+      if (this.unsupported.has(object)) {
+        break;
+      }
+      try {
+        children.push(...await this.queryChildren(rel, group));
+      } catch (err) {
+        if (err instanceof CancelledError) {
+          throw err;
+        }
+        if (group.length > 1 && isOrUnsupportedError(err) && !this.singleIdObjects.has(object)) {
+          this.singleIdObjects.add(object);
+          return await this.queryChildChunk(rel, ids);
+        }
+        this.markUnsupported(object);
+        break;
+      }
+    }
+    return children;
   }
 
   async walk() {
+    let globalInfo = await this.describeGlobal();
     let rootDescribe = await this.describe(this.sobjectName);
     if (!rootDescribe) {
       throw new Error("Cannot describe " + this.sobjectName);
     }
     // Query the root to validate it exists and to get its 18 character Id
-    let rootRecords = await this.queryAll("SELECT Id FROM " + rootDescribe.name + " WHERE Id = " + soqlString(this.recordId));
+    let rootName = this.nameFields.get(rootDescribe.name);
+    let rootRecords = await this.queryAll("SELECT Id" + (rootName && rootName != "Id" ? ", " + rootName : "") + " FROM " + rootDescribe.name + " WHERE Id = " + soqlString(this.recordId));
     if (rootRecords.length == 0) {
       throw new Error("Record " + this.recordId + " not found in " + rootDescribe.name);
     }
     this.rootId = rootRecords[0].Id;
     let rootKey = shortId(this.rootId);
     this.records.set(rootKey, {id: this.rootId, object: rootDescribe.name, layer: 0});
+    this.mergeValues(this.rootId, rootRecords[0]);
+    this.refreshRows(true);
 
     // Breadth first: each layer is queried per relationship, for all the records of the previous layer at once
     let frontier = [rootKey];
@@ -270,51 +457,41 @@ class Model {
         idsByObject.get(object).push(key);
       }
 
-      // Describe the parent objects, then every child object we may query
+      // Only the objects that are expanded are described, child objects are judged from describeGlobal
       let parentDescribes = new Map();
       for (let object of idsByObject.keys()) {
         parentDescribes.set(object, await this.describe(object));
       }
-      let childNames = new Set();
-      for (let describe of parentDescribes.values()) {
-        for (let rel of describe ? describe.childRelationships : []) {
-          if (rel.relationshipName && !rel.deprecatedAndHidden) {
-            childNames.add(rel.childSObject);
-          }
-        }
-      }
-      let childDescribes = new Map();
-      await this.runPool([...childNames].map(name => async () => {
-        let describe = await this.describe(name);
-        if (describe) {
-          childDescribes.set(name, describe);
-        }
-      }), "Describe");
 
       let queryTasks = [];
       for (let [object, ids] of idsByObject) {
         let describe = parentDescribes.get(object);
         for (let rel of describe ? describe.childRelationships : []) {
-          if (!this.isRelationshipUsable(rel, childDescribes)) {
+          if (!this.isChildWalkable(rel, globalInfo)) {
             continue;
           }
           let parentKeys = new Set(ids);
           let fullIds = ids.map(key => this.records.get(key).id);
           for (let idsChunk of chunk(fullIds, LOOKUP_IDS_PER_QUERY)) {
             queryTasks.push(async () => {
-              let query = "SELECT Id, " + rel.field + " FROM " + rel.childSObject + " WHERE " + rel.field + " IN (" + idsChunk.map(soqlString).join(",") + ")";
-              let children = await this.queryAll(query);
+              let children = await this.queryChildChunk(rel, idsChunk);
               for (let child of children) {
                 let parentKey = shortId(child[rel.field]);
                 if (parentKeys.has(parentKey)) {
-                  this.addChild(parentKey, child.Id, rel, layer, nextFrontier);
+                  if (this.addChild(parentKey, child.Id, rel, layer, nextFrontier)) {
+                    this.mergeValues(child.Id, child);
+                  }
                 }
               }
             });
           }
         }
       }
-      await this.runPool(queryTasks, "Query children");
+      try {
+        await this.runPool(queryTasks, "Query children");
+      } finally {
+        this.refreshRows(true);
+      }
       frontier = nextFrontier;
     }
   }
@@ -327,7 +504,7 @@ class Model {
     if (isNew) {
       if (this.records.size >= MAX_RECORDS) {
         this.capHit = true;
-        return;
+        return false;
       }
       this.records.set(childKey, {id: childId, object: rel.childSObject, layer});
       nextFrontier.push(childKey);
@@ -339,7 +516,9 @@ class Model {
     let edgeList = this.edges.get(childKey);
     if (!edgeList.some(e => e.parentId === parentKey && e.step === step)) {
       edgeList.push({parentId: parentKey, step});
+      this.edgeVersion++;
     }
+    return isNew;
   }
 
   fieldsToQuery(describe) {
@@ -365,7 +544,6 @@ class Model {
         continue;
       }
       let names = this.fieldsToQuery(describe).filter(name => name != "Id");
-      this.fieldNames.set(object, ["Id", ...names]);
       // Split the fields so each query stays below the query length limit, Id is always selected
       let fieldChunks = [];
       let current = [];
@@ -385,9 +563,9 @@ class Model {
           tasks.push(async () => {
             let query = "SELECT " + ["Id", ...fields].join(",") + " FROM " + object + " WHERE Id IN (" + idsChunk.map(soqlString).join(",") + ")";
             for (let rec of await this.queryAll(query)) {
-              let key = shortId(rec.Id);
-              this.values.set(key, Object.assign(this.values.get(key) || {}, rec));
+              this.mergeValues(rec.Id, rec);
             }
+            this.refreshRows(false);
           });
         }
       }
@@ -409,6 +587,13 @@ class Model {
       let rec = this.records.get(key);
       return rec.object + "(" + rec.id + ")";
     };
+    if (this.pathCacheVersion != this.edgeVersion) {
+      this.pathCache = new Map();
+      this.pathCacheVersion = this.edgeVersion;
+    }
+    if (this.pathCache.has(id)) {
+      return this.pathCache.get(id);
+    }
     let paths = [];
     let total = 0;
     let budget = PATH_SEARCH_BUDGET;
@@ -436,35 +621,34 @@ class Model {
     if (total > paths.length) {
       paths.push("(+" + (total - paths.length) + (total >= PATH_ENUMERATION_LIMIT ? "+" : "") + " more paths truncated)");
     }
-    return paths.join("\n");
+    let result = paths.join("\n");
+    this.pathCache.set(id, result);
+    return result;
   }
 
+  // Emits a row for every loaded value of every collected record, so a record is listed even if only its Id is known
   buildRows() {
     let rows = [];
     for (let record of this.records.values()) {
-      let values = this.values.get(shortId(record.id));
-      let names = this.fieldNames.get(record.object);
-      if (!values || !names) {
-        continue;
-      }
+      let values = this.values.get(shortId(record.id)) || {Id: record.id};
       let path = this.pathsFor(record.id);
-      for (let name of names) {
-        if (name in values) {
-          rows.push({
-            key: record.id + "." + name,
-            field: name,
-            value: formatValue(values[name]),
-            object: record.object,
-            layer: record.layer,
-            id: record.id,
-            path
-          });
-        }
+      for (let name of Object.keys(values)) {
+        rows.push({
+          key: record.id + "." + name,
+          field: name,
+          value: formatValue(values[name]),
+          object: record.object,
+          layer: record.layer,
+          id: record.id,
+          path
+        });
       }
     }
+    let fieldRank = field => field == "Id" ? 0 : 1;
     rows.sort((a, b) => a.layer - b.layer
       || a.object.localeCompare(b.object)
       || a.id.localeCompare(b.id)
+      || fieldRank(a.field) - fieldRank(b.field)
       || a.field.localeCompare(b.field));
     this.rows = rows;
   }
@@ -488,6 +672,39 @@ class App extends React.Component {
     this.onRun = this.onRun.bind(this);
     this.onCancel = this.onCancel.bind(this);
     this.onFilterChange = this.onFilterChange.bind(this);
+    this.onIncludeSystemChange = this.onIncludeSystemChange.bind(this);
+    this.onToggleWarnings = this.onToggleWarnings.bind(this);
+    this.state = {warningsOpen: null}; // null: open when there are at most 3 warnings
+  }
+
+  onIncludeSystemChange(e) {
+    let {model} = this.props;
+    model.includeSystem = e.target.checked;
+    let args = new URLSearchParams(location.search.slice(1));
+    if (model.includeSystem) {
+      args.set("includeSystem", "1");
+    } else {
+      args.delete("includeSystem");
+    }
+    history.replaceState(null, "", "?" + args.toString());
+    model.didUpdate();
+  }
+
+  onToggleWarnings(open) {
+    this.setState({warningsOpen: open});
+  }
+
+  renderWarnings(warnings) {
+    let open = this.state.warningsOpen === null ? warnings.length <= 3 : this.state.warningsOpen;
+    let shown = warnings.slice(0, MAX_SHOWN_WARNINGS);
+    return h("div", {className: "slds-notify slds-notify_alert slds-alert_warning slds-m-horizontal_small", role: "status", style: {display: "block"}},
+      h("button", {className: "slds-button", "aria-expanded": String(open), onClick: () => this.onToggleWarnings(!open)},
+        (open ? "\u25BE " : "\u25B8 ") + warnings.length + (warnings.length == 1 ? " warning" : " warnings")),
+      open ? h("ul", {className: "slds-m-left_large"},
+        shown.map((message, index) => h("li", {key: index}, message)),
+        warnings.length > shown.length ? h("li", {key: "more"}, "... and " + (warnings.length - shown.length) + " more warnings") : null
+      ) : null
+    );
   }
 
   onDepthChange(e) {
@@ -521,7 +738,7 @@ class App extends React.Component {
       parts.push("API calls: " + model.apiCalls);
     }
     if (model.running) {
-      parts.push(model.cancelled ? "Cancelling..." : "Running...");
+      parts.push(model.cancelled ? "Cancelling..." : (model.phase ? "Running (" + model.phase.toLowerCase() + ")..." : "Running..."));
     } else if (model.finished) {
       parts.push(model.stoppedEarly ? "Cancelled, partial results" : "Done");
     }
@@ -548,10 +765,6 @@ class App extends React.Component {
     document.title = "Child Tree - " + model.sobjectName;
     let rows = model.filteredRows();
     let shownRows = rows.slice(0, MAX_RENDERED_ROWS);
-    let warnings = model.warnings.slice(0, MAX_SHOWN_WARNINGS);
-    if (model.warnings.length > MAX_SHOWN_WARNINGS) {
-      warnings.push("... and " + (model.warnings.length - MAX_SHOWN_WARNINGS) + " more warnings");
-    }
     return h("div", {},
       h(PageHeader, {
         pageTitle: "Child Tree",
@@ -566,7 +779,7 @@ class App extends React.Component {
         h("div", {className: "slds-card slds-m-around_medium", style: {flex: "1 1 0", display: "flex", flexDirection: "column", minHeight: 0}},
           model.errorMessages.length > 0 ? this.renderAlert("slds-alert_error", "error", model.errorMessages) : null,
           model.capHit ? this.renderAlert("slds-alert_warning", "warning", ["Stopped expanding after " + MAX_RECORDS + " unique records. Results are incomplete, try a lower depth."]) : null,
-          warnings.length > 0 ? this.renderAlert("slds-alert_warning", "warning", warnings) : null,
+          model.warnings.length > 0 ? this.renderWarnings(model.warnings) : null,
           h("div", {className: "slds-card__header slds-grid slds-grid_vertical-align-center slds-p-around_small"},
             h("div", {className: "slds-form-element slds-m-right_small"},
               h("label", {className: "slds-form-element__label", htmlFor: "depth"}, "Depth (" + MIN_DEPTH + "-" + MAX_DEPTH + ")"),
@@ -585,12 +798,21 @@ class App extends React.Component {
                 })
               )
             ),
+            h("div", {className: "slds-form-element slds-m-right_small"},
+              h("div", {className: "slds-form-element__control"},
+                h("label", {className: "slds-checkbox"},
+                  h("input", {id: "includeSystem", type: "checkbox", checked: model.includeSystem, disabled: model.running, onChange: this.onIncludeSystemChange}),
+                  h("span", {className: "slds-checkbox_faux"}),
+                  h("span", {className: "slds-form-element__label"}, "Include system relationships")
+                )
+              )
+            ),
             h("button", {className: "slds-button slds-button_brand slds-m-right_x-small", disabled: model.running || !model.hasValidTarget(), onClick: this.onRun, title: "Walk the descendant child records down to the chosen depth"}, "Run"),
             h("button", {className: "slds-button slds-button_neutral slds-m-right_small", disabled: !model.running || model.cancelled, onClick: this.onCancel, title: "Stop starting new queries"}, "Cancel"),
             h("input", {className: "slds-input slds-m-right_small", style: {maxWidth: "20rem"}, placeholder: "Filter", value: model.rowsFilter, onChange: this.onFilterChange}),
             h("span", {className: "slds-text-body_small"}, this.renderStatus(model))
           ),
-          model.finished && rows.length > shownRows.length
+          rows.length > shownRows.length
             ? h("div", {className: "slds-p-horizontal_small slds-text-body_small"}, "Showing the first " + shownRows.length + " of " + rows.length + " rows, use the filter to narrow down.")
             : null,
           h("div", {className: "sfir-tree-table-wrapper"},
@@ -625,7 +847,7 @@ class App extends React.Component {
   initButton(sfHost, true);
   sfConn.getSession(sfHost).then(() => {
     let root = document.getElementById("root");
-    let model = new Model(sfHost, args.get("objectType"), args.get("recordId"));
+    let model = new Model(sfHost, args.get("objectType"), args.get("recordId"), args.get("includeSystem") == "1");
     if (!model.hasValidTarget()) {
       model.errorMessages.push("A valid objectType and recordId URL parameter are required.");
     }
