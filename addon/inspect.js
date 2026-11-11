@@ -376,6 +376,17 @@ Structure your response clearly with appropriate headings.`;
     }
     return this.dataExportUrl(query);
   }
+  childTreeLink() {
+    let objectName = this.objectData && this.objectData.name ? this.objectData.name : this.sobjectName;
+    if (!objectName || !this.recordData || !this.recordId) {
+      return undefined;
+    }
+    let args = new URLSearchParams();
+    args.set("host", this.sfHost);
+    args.set("objectType", objectName);
+    args.set("recordId", this.recordId);
+    return "relationship-tree.html?" + args;
+  }
   dataExportUrl(query) {
     let args = new URLSearchParams();
     args.set("host", this.sfHost);
@@ -1918,6 +1929,7 @@ class App extends React.Component {
               onClick: this.onDoCreate
             }, model.recordData ? "Clone" : "New") : null,
             model.exportLink() ? h("a", {href: model.exportLink(), target: linkTarget, title: "Export data from this object", className: "slds-button slds-button_neutral"}, "Export") : null,
+            model.childTreeLink() ? h("a", {href: model.childTreeLink(), target: linkTarget, title: "Show descendant child records down N levels", className: "slds-button slds-button_neutral"}, "Child Tree") : null,
             model.objectName() ? h("a", {href: "about:blank", onClick: this.onShowObjectMetadata, className: "slds-button slds-button_neutral"}, "More") : null,
             h("div", {className: "slds-dropdown-trigger slds-dropdown-trigger_click slds-is-open slds-button_last"},
               h("button", {className: "slds-button slds-button_icon slds-button_icon-border-filled", onClick: this.onToggleObjectActions},
