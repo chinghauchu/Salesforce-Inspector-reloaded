@@ -2,6 +2,7 @@
 import {sfConn, apiVersion} from "./inspector.js";
 import {PageHeader} from "./components/PageHeader.js";
 import {UserInfoModel} from "./utils.js";
+import {generateQueries, pathLabel, shortenLabel} from "./relationship-tree-soql.js";
 /* global initButton */
 
 const MIN_DEPTH = 1;
@@ -132,6 +133,8 @@ class Model {
     this.describeCache = new Map(); // object API name -> Promise of describe (null when it failed)
     this.globalPromise = null; // describeGlobal, requested once per page session
     this.nameFields = new Map(); // object API name -> name field to query (null when the object has none), unknown when absent
+    this.selected = new Map(); // row key (record id + field) -> {key, id, object, field, value}, kept while filtering and after Cancel
+    this.generated = {generating: false, error: "", queries: []};
     this.resetRun();
   }
 
@@ -200,8 +203,8 @@ class Model {
   }
 
   // Every API call goes through here so they are counted and no new one starts after Cancel
-  async api(url) {
-    if (this.cancelled) {
+  async api(url, ignoreCancel) {
+    if (this.cancelled && !ignoreCancel) {
       throw new CancelledError("Cancelled");
     }
     this.apiCalls++;
@@ -261,9 +264,10 @@ class Model {
     return isCustomObject(name, info) || KEEP_STANDARD_NAMES.has(name);
   }
 
-  describe(name) {
+  // ignoreCancel: used by query generation, which must work after Cancel
+  describe(name, ignoreCancel) {
     if (!this.describeCache.has(name)) {
-      this.describeCache.set(name, this.api("/services/data/v" + apiVersion + "/sobjects/" + encodeURIComponent(name) + "/describe")
+      this.describeCache.set(name, this.api("/services/data/v" + apiVersion + "/sobjects/" + encodeURIComponent(name) + "/describe", ignoreCancel)
         .then(describe => {
           let nameField = describe.fields.find(f => f.nameField);
           this.nameFields.set(describe.name, nameField ? nameField.name : null);
@@ -326,6 +330,8 @@ class Model {
       return;
     }
     this.resetRun();
+    this.selected.clear(); // a new walk can find other records
+    this.generated = {generating: false, error: "", queries: []};
     this.depth = clampDepth(this.depthInput);
     this.depthInput = String(this.depth);
     this.running = true;
@@ -689,6 +695,107 @@ class Model {
     this.rows = rows;
   }
 
+  toggleSelected(row) {
+    if (this.selected.has(row.key)) {
+      this.selected.delete(row.key);
+    } else {
+      this.selected.set(row.key, {key: row.key, id: row.id, object: row.object, field: row.field, value: row.value});
+    }
+    this.didUpdate();
+  }
+
+  removeSelected(key) {
+    this.selected.delete(key);
+    this.didUpdate();
+  }
+
+  clearSelected() {
+    this.selected.clear();
+    this.didUpdate();
+  }
+
+  // Steps of the first shortest path without loop from the root to the record: [{parentObject, childObject, relationshipName, field}].
+  // An edge from a record of a lower layer is never part of a loop. Null when the record is unknown.
+  stepsFor(id) {
+    let rootKey = shortId(this.rootId);
+    let steps = [];
+    let key = shortId(id);
+    let rec = this.records.get(key);
+    if (!rec) {
+      return null;
+    }
+    while (key !== rootKey) {
+      let edges = this.edges.get(key) || [];
+      let edge = edges.find(e => this.records.get(e.parentId).layer == rec.layer - 1) || edges.find(e => this.records.get(e.parentId).layer < rec.layer);
+      if (!edge) {
+        return null;
+      }
+      let dot = edge.step.indexOf(".");
+      let parent = this.records.get(edge.parentId);
+      steps.unshift({parentObject: parent.object, childObject: rec.object, relationshipName: edge.step.substring(0, dot), field: edge.step.substring(dot + 1)});
+      key = edge.parentId;
+      rec = parent;
+    }
+    return steps;
+  }
+
+  // Selected rows grouped by object and path, sorted. Rows of records without a known path are returned in `unknown`.
+  selectionGroups() {
+    let groups = new Map();
+    let unknown = [];
+    for (let item of this.selected.values()) {
+      let steps = this.stepsFor(item.id);
+      if (!steps) {
+        unknown.push(item);
+        continue;
+      }
+      let label = pathLabel(this.sobjectName, steps);
+      let groupKey = item.object + "\n" + label;
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, {key: groupKey, object: item.object, steps, label, items: []});
+      }
+      groups.get(groupKey).items.push(item);
+    }
+    let list = [...groups.values()].sort((a, b) => a.object.localeCompare(b.object) || a.steps.length - b.steps.length || a.label.localeCompare(b.label));
+    return {groups: list, unknown};
+  }
+
+  // Describes the objects of every path (works after Cancel), then builds one query per group
+  async generate() {
+    if (this.generated.generating) {
+      return;
+    }
+    this.generated = {generating: true, error: "", queries: []};
+    this.didUpdate();
+    try {
+      let {groups, unknown} = this.selectionGroups();
+      let describes = {};
+      let names = new Set();
+      for (let group of groups) {
+        names.add(group.object);
+        for (let step of group.steps.slice(1)) {
+          names.add(step.childObject);
+        }
+      }
+      await Promise.all([...names].map(async name => {
+        describes[name] = await this.describe(name, true);
+      }));
+      let queries = generateQueries(groups, describes, this.rootId, this.sobjectName);
+      this.generated = {generating: false, error: unknown.length ? unknown.length + " selected values skipped: record not found" : "", queries};
+    } catch (err) {
+      console.error(err);
+      this.generated = {generating: false, error: "Error generating queries: " + (err.message || err), queries: []};
+    }
+    this.didUpdate();
+  }
+
+  dataExportUrl(query) {
+    let args = new URLSearchParams();
+    args.set("host", this.sfHost);
+    args.set("query", query);
+    return "data-export.html?" + args;
+  }
+
   filteredRows() {
     let filter = this.rowsFilter.trim().toLowerCase();
     if (!filter) {
@@ -710,7 +817,9 @@ class App extends React.Component {
     this.onFilterChange = this.onFilterChange.bind(this);
     this.onIncludeSystemChange = this.onIncludeSystemChange.bind(this);
     this.onToggleWarnings = this.onToggleWarnings.bind(this);
-    this.state = {warningsOpen: null}; // null: open when there are at most 3 warnings
+    this.onGenerate = this.onGenerate.bind(this);
+    this.copyTimer = null;
+    this.state = {warningsOpen: null, copied: null}; // warningsOpen null: open when there are at most 3 warnings
   }
 
   onIncludeSystemChange(e) {
@@ -739,6 +848,86 @@ class App extends React.Component {
       open ? h("ul", {className: "slds-m-left_large"},
         shown.map((message, index) => h("li", {key: index}, message)),
         warnings.length > shown.length ? h("li", {key: "more"}, "... and " + (warnings.length - shown.length) + " more warnings") : null
+      ) : null
+    );
+  }
+
+  onGenerate() {
+    this.props.model.generate();
+  }
+
+  componentWillUnmount() {
+    clearTimeout(this.copyTimer);
+  }
+
+  copyText(id, text) {
+    navigator.clipboard.writeText(text).then(() => {
+      this.setState({copied: id});
+      clearTimeout(this.copyTimer);
+      this.copyTimer = setTimeout(() => this.setState({copied: null}), 1500);
+    }).catch(err => {
+      this.props.model.generated.error = "Copy failed: " + (err.message || err);
+      this.props.model.didUpdate();
+    });
+  }
+
+  // A click that ends a text selection or lands on a link/control must not toggle the row
+  onRowClick(row, e) {
+    if (e.target.closest("a, button, textarea, select")) {
+      return;
+    }
+    let selection = window.getSelection();
+    if (selection && !selection.isCollapsed && selection.toString() != "" && e.currentTarget.contains(selection.anchorNode) && e.currentTarget.contains(selection.focusNode)) {
+      return;
+    }
+    this.props.model.toggleSelected(row);
+  }
+
+  renderSelectionPanel(model) {
+    let {groups, unknown} = model.selectionGroups();
+    let {generating, error, queries} = model.generated;
+    if (model.selected.size == 0 && queries.length == 0 && !error) {
+      return null;
+    }
+    let chipLabel = item => item.object + "." + item.field + " = " + (item.value === "" ? "null" : item.value);
+    let allText = queries.map(q => q.text).join("\n\n");
+    return h("div", {className: "sfir-tree-selection slds-p-around_small"},
+      h("div", {className: "slds-grid slds-grid_vertical-align-center slds-m-bottom_x-small"},
+        h("strong", {className: "slds-m-right_small"}, "Selected (" + model.selected.size + ")"),
+        h("button", {className: "slds-button slds-button_brand slds-m-right_x-small", disabled: model.selected.size == 0 || generating, onClick: this.onGenerate, title: "Build SOQL queries from the selected values"},
+          generating ? "Generating..." : "Generate"),
+        h("button", {className: "slds-button slds-button_neutral", disabled: model.selected.size == 0, onClick: () => model.clearSelected()}, "Clear all")
+      ),
+      model.selected.size > 0 ? h("div", {className: "sfir-tree-selected-list"},
+        groups.map(group =>
+          h("div", {key: group.key, className: "sfir-tree-selected-group"},
+            h("div", {className: "sfir-tree-selected-header", title: group.label}, group.object + " — " + shortenLabel(group.label)),
+            group.items.map(item =>
+              h("span", {key: item.key, className: "sfir-tree-chip", title: chipLabel(item)},
+                h("span", {className: "sfir-tree-chip-text"}, chipLabel(item)),
+                h("button", {className: "sfir-tree-chip-remove", "aria-label": "Remove " + chipLabel(item), onClick: () => model.removeSelected(item.key)}, "✕")
+              )
+            )
+          )
+        ),
+        unknown.length > 0 ? h("div", {className: "sfir-tree-selected-header"}, unknown.length + " selected values have no known path") : null
+      ) : null,
+      error ? h("div", {className: "slds-text-color_error slds-m-top_x-small", role: "alert"}, error) : null,
+      queries.length > 0 ? h("div", {className: "sfir-tree-queries slds-m-top_x-small"},
+        h("div", {className: "slds-grid slds-grid_vertical-align-center slds-m-bottom_x-small"},
+          h("strong", {className: "slds-m-right_small"}, "Generated queries (" + queries.length + ")"),
+          h("button", {className: "slds-button slds-button_neutral", onClick: () => this.copyText("all", allText)}, this.state.copied == "all" ? "Copied" : "Copy all")
+        ),
+        queries.map((query, index) =>
+          h("div", {key: index, className: "sfir-tree-query"},
+            h("div", {className: "slds-grid slds-grid_vertical-align-center"},
+              h("span", {className: "sfir-tree-selected-header slds-col", title: query.pathLabel}, query.object + " — " + shortenLabel(query.pathLabel)),
+              h("button", {className: "slds-button slds-button_neutral", onClick: () => this.copyText(index, query.text), title: "Copy the query"}, this.state.copied == index ? "Copied" : "Copy"),
+              h("a", {className: "slds-button slds-button_neutral", href: model.dataExportUrl(query.soql), target: "_blank", rel: "noopener", title: "Open the query in Data Export in a new tab"}, "Open in Data Export")
+            ),
+            h("pre", {className: "sfir-tree-query-text"}, query.text)
+          )
+        )
       ) : null
     );
   }
@@ -863,16 +1052,23 @@ class App extends React.Component {
           rows.length > shownRows.length
             ? h("div", {className: "slds-p-horizontal_small slds-text-body_small"}, "Showing the first " + shownRows.length + " of " + rows.length + " rows, use the filter to narrow down.")
             : null,
+          this.renderSelectionPanel(model),
           h("div", {className: "sfir-tree-table-wrapper"},
             h("table", {className: "slds-table slds-table_bordered slds-table_cell-buffer sfir-tree-table"},
               h("thead", {},
                 h("tr", {className: "slds-line-height_reset"},
-                  ["Field", "Value", "Object", "Layer", "Path"].map(title => h("th", {key: title, scope: "col"}, h("div", {className: "slds-truncate"}, title)))
+                  [h("th", {key: "select", scope: "col", "aria-label": "Select"}), ...["Field", "Value", "Object", "Layer", "Path"].map(title => h("th", {key: title, scope: "col"}, h("div", {className: "slds-truncate"}, title)))]
                 )
               ),
               h("tbody", {},
                 shownRows.map((row, index) =>
-                  h("tr", {key: row.key, className: index == 0 || shownRows[index - 1].id != row.id ? "sfir-tree-first-row" : ""},
+                  h("tr", {
+                    key: row.key,
+                    className: (index == 0 || shownRows[index - 1].id != row.id ? "sfir-tree-first-row" : "") + (model.selected.has(row.key) ? " sfir-tree-selected-row" : ""),
+                    "aria-selected": model.selected.has(row.key),
+                    onClick: e => this.onRowClick(row, e)
+                  },
+                    h("td", {}, h("input", {type: "checkbox", checked: model.selected.has(row.key), onChange: () => {}, "aria-label": "Select " + row.field})),
                     h("td", {}, row.field),
                     h("td", {className: "sfir-tree-value"}, row.value),
                     h("td", {}, row.object),

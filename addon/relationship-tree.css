@@ -54,3 +54,78 @@
 .sfir-tree-table tr.sfir-tree-first-row td {
   border-top: 2px solid #c9c9c9;
 }
+
+.sfir-tree-table tbody tr {
+  cursor: pointer;
+}
+
+.sfir-tree-table tbody tr.sfir-tree-selected-row td {
+  background: #e3f3ff;
+}
+
+.sfir-tree-selection {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  flex: 0 0 auto;
+  max-height: 50vh;
+  overflow: auto;
+  background: #fff;
+  border-bottom: 1px solid #c9c9c9;
+}
+
+.sfir-tree-selected-list {
+  max-height: 12rem;
+  overflow: auto;
+}
+
+.sfir-tree-selected-group {
+  margin-bottom: 0.25rem;
+}
+
+.sfir-tree-selected-header {
+  font-size: 0.75rem;
+  color: #706e6b;
+  word-break: break-all;
+}
+
+.sfir-tree-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 24rem;
+  margin: 0.125rem 0.25rem 0.125rem 0;
+  padding: 0 0.25rem 0 0.5rem;
+  border: 1px solid #c9c9c9;
+  border-radius: 0.75rem;
+  background: #f3f3f3;
+  font-size: 0.75rem;
+}
+
+.sfir-tree-chip-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sfir-tree-chip-remove {
+  margin-left: 0.25rem;
+  padding: 0 0.25rem;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  color: #706e6b;
+}
+
+.sfir-tree-query {
+  margin-bottom: 0.5rem;
+}
+
+.sfir-tree-query-text {
+  margin: 0.25rem 0 0;
+  padding: 0.5rem;
+  background: #f3f3f3;
+  border: 1px solid #e5e5e5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
