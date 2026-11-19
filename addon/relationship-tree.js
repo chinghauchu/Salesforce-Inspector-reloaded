@@ -580,7 +580,13 @@ class Model {
     }
   }
 
-  // All simple paths from the root to a record, searched backwards over the recorded edges
+  // Paths of a record, searched backwards over the recorded edges. Returns
+  //   {entries: [{text, loop}], truncated: number, limitHit: boolean}
+  // - normal entries (loop: false) are the simple root -> record paths, listed first
+  // - loop entries (loop: true) exist for every recorded edge P -> X (step S) where X is on a simple root -> P path:
+  //   "<simple path to P containing X> > S > X". They are listed after the normal ones.
+  // At most MAX_PATHS_PER_RECORD entries are returned; truncated counts the paths left out
+  // (a lower bound when limitHit is true, because a search limit stopped the enumeration).
   pathsFor(id) {
     let rootKey = shortId(this.rootId);
     let label = key => {
@@ -594,34 +600,62 @@ class Model {
     if (this.pathCache.has(id)) {
       return this.pathCache.get(id);
     }
-    let paths = [];
-    let total = 0;
-    let budget = PATH_SEARCH_BUDGET;
-    let visited = new Set();
-    let search = (nodeId, tail) => {
-      if (budget-- <= 0 || total >= PATH_ENUMERATION_LIMIT) {
-        return;
-      }
-      if (nodeId === rootKey) {
-        total++;
-        if (paths.length < MAX_PATHS_PER_RECORD) {
-          paths.push(label(nodeId) + tail.join(""));
+    let targetKey = shortId(id);
+    let limitHit = false;
+    // Enumerates simple root -> startKey paths (backwards from startKey); with requiredKey only those containing it.
+    // Calls onPath(text) per path, stops when onPath returns false or a limit is reached.
+    let enumerate = (startKey, requiredKey, onPath) => {
+      let budget = PATH_SEARCH_BUDGET;
+      let found = 0;
+      let visited = new Set();
+      let search = (nodeId, tail, hasRequired) => {
+        if (budget-- <= 0 || found >= PATH_ENUMERATION_LIMIT) {
+          limitHit = true;
+          return;
         }
-        return;
-      }
-      visited.add(nodeId);
-      for (let edge of this.edges.get(nodeId) || []) {
-        if (!visited.has(edge.parentId)) {
-          search(edge.parentId, [" > " + edge.step + " > " + label(nodeId), ...tail]);
+        hasRequired = hasRequired || nodeId === requiredKey;
+        if (nodeId === rootKey) {
+          if (hasRequired) {
+            found++;
+            onPath(label(nodeId) + tail.join(""));
+          }
+          return;
         }
-      }
-      visited.delete(nodeId);
+        visited.add(nodeId);
+        for (let edge of this.edges.get(nodeId) || []) {
+          if (!visited.has(edge.parentId)) {
+            search(edge.parentId, [" > " + edge.step + " > " + label(nodeId), ...tail], hasRequired);
+          }
+        }
+        visited.delete(nodeId);
+      };
+      search(startKey, [], requiredKey === null);
+      return found;
     };
-    search(shortId(id), []);
-    if (total > paths.length) {
-      paths.push("(+" + (total - paths.length) + (total >= PATH_ENUMERATION_LIMIT ? "+" : "") + " more paths truncated)");
+
+    let normal = [];
+    let normalTotal = enumerate(targetKey, null, text => {
+      if (normal.length < MAX_PATHS_PER_RECORD) {
+        normal.push({text, loop: false});
+      }
+    });
+    let loops = [];
+    let loopTotal = 0;
+    let seenLoops = new Set();
+    for (let edge of this.edges.get(targetKey) || []) {
+      enumerate(edge.parentId, targetKey, text => {
+        let loopText = text + " > " + edge.step + " > " + label(targetKey);
+        if (!seenLoops.has(loopText)) {
+          seenLoops.add(loopText);
+          loopTotal++;
+          if (loops.length < MAX_PATHS_PER_RECORD) {
+            loops.push({text: loopText, loop: true});
+          }
+        }
+      });
     }
-    let result = paths.join("\n");
+    let entries = [...normal, ...loops].slice(0, MAX_PATHS_PER_RECORD);
+    let result = {entries, truncated: normalTotal + loopTotal - entries.length, limitHit};
     this.pathCache.set(id, result);
     return result;
   }
@@ -631,7 +665,8 @@ class Model {
     let rows = [];
     for (let record of this.records.values()) {
       let values = this.values.get(shortId(record.id)) || {Id: record.id};
-      let path = this.pathsFor(record.id);
+      let paths = this.pathsFor(record.id);
+      let pathText = paths.entries.map(e => e.text + (e.loop ? " [loop]" : "")).join("\n");
       for (let name of Object.keys(values)) {
         rows.push({
           key: record.id + "." + name,
@@ -640,7 +675,8 @@ class Model {
           object: record.object,
           layer: record.layer,
           id: record.id,
-          path
+          paths,
+          pathText
         });
       }
     }
@@ -658,7 +694,7 @@ class Model {
     if (!filter) {
       return this.rows;
     }
-    return this.rows.filter(r => [r.field, r.value, r.object, r.path].some(text => text.toLowerCase().includes(filter)));
+    return this.rows.filter(r => [r.field, r.value, r.object, r.pathText].some(text => text.toLowerCase().includes(filter)));
   }
 }
 
@@ -760,6 +796,18 @@ class App extends React.Component {
     );
   }
 
+  renderPaths({entries, truncated, limitHit}) {
+    return h("ul", {className: "sfir-tree-path-list"},
+      entries.map((entry, index) =>
+        h("li", {key: index, className: entry.loop ? "sfir-tree-path-loop" : ""},
+          entry.text,
+          entry.loop ? h("span", {className: "sfir-tree-loop-badge", title: "This path loops back to a record already on it"}, "↻ loop") : null
+        )
+      ),
+      truncated > 0 ? h("li", {key: "truncated", className: "sfir-tree-path-note"}, "(+" + truncated + (limitHit ? "+" : "") + " more paths truncated)") : null
+    );
+  }
+
   render() {
     let {model} = this.props;
     document.title = "Child Tree - " + model.sobjectName;
@@ -829,7 +877,7 @@ class App extends React.Component {
                     h("td", {className: "sfir-tree-value"}, row.value),
                     h("td", {}, row.object),
                     h("td", {}, row.layer),
-                    h("td", {className: "sfir-tree-path"}, row.path)
+                    h("td", {className: "sfir-tree-path"}, this.renderPaths(row.paths))
                   )
                 )
               )
