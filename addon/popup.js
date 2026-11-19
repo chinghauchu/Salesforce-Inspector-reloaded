@@ -4076,6 +4076,17 @@ class AllDataSelection extends React.PureComponent {
       return undefined;
     }
   }
+  getChildTreeUrl() {
+    let {sfHost, selectedValue} = this.props;
+    if (selectedValue && selectedValue.recordId) {
+      let args = new URLSearchParams();
+      args.set("host", sfHost);
+      args.set("objectType", selectedValue.sobject.name);
+      args.set("recordId", selectedValue.recordId);
+      return "relationship-tree.html?" + args;
+    }
+    return undefined;
+  }
   getUrl(basePath, params) {
     const {sfHost, selectedValue} = this.props;
     const args = new URLSearchParams({host: sfHost, ...params});
@@ -4558,6 +4569,19 @@ class AllDataSelection extends React.PureComponent {
           )
         )
       ),
+      selectedValue.recordId
+        ? h(
+          "a",
+          {
+            href: this.getChildTreeUrl(),
+            target: linkTarget,
+            title: "Show descendant child records down N levels",
+            className:
+                "button page-button slds-button slds-button_neutral slds-m-top_xx-small slds-m-bottom_xx-small",
+          },
+          "Child Tree"
+        )
+        : null,
       isFieldsPresent
         ? h(
           "button",
